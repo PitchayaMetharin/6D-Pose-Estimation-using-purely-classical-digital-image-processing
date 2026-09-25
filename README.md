@@ -18,19 +18,22 @@ The complete theory, equations, implementation record, verification results, scr
 - [Mini-project report](6D_Pose_Estimation_Mini_Project_Report.md)
 - [Implementation plan and defect analysis](6d_plan.md)
 
-## Run
+## Setup and run
 
 The verified environment uses Python 3.10, OpenCV with the `aruco` module, NumPy, Linux/V4L2, and a 1280 × 720 camera stream.
 
 ```bash
-cd 6D_Pose
-../vision_env/bin/python 6d.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python 6d.py
 ```
 
 Calibrate the camera when the lens, focus, zoom, or capture resolution changes:
 
 ```bash
-../vision_env/bin/python 6d.py --calibrate
+python 6d.py --calibrate
 ```
 
 The repository contains the calibration used for the documented demonstration. A different camera requires its own calibration.
@@ -50,9 +53,9 @@ The repository contains the calibration used for the documented demonstration. A
 ## Verification
 
 ```bash
-python3 -m pytest -q
-python3 -m unittest discover -s tests -q
-python3 -m py_compile 6d.py pose6d/*.py tests/*.py
+python -m pytest -q
+python -m unittest discover -s tests -q
+python -m py_compile 6d.py pose6d/*.py tests/*.py
 ```
 
 Current result: **14 tests pass**. See the report for the distinction between automated regression tests, noise-free synthetic diagnostics, and live observations.
