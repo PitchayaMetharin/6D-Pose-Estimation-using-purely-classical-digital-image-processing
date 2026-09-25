@@ -12,7 +12,12 @@ from .cube_geometry import (
     iter_cube_six_point_candidates, iter_quad_orders,
     rotation_distance_radians,
 )
-from .settings import CUBE_LOCAL_MAPPING_LIMIT
+from .settings import (
+    CUBE_LOCAL_MAPPING_LIMIT,
+    CUBE_PARTIAL_MAX_ANGLE_ERROR_DEG,
+    CUBE_PARTIAL_MAX_EDGE_RESIDUAL_PIXELS,
+    CUBE_PARTIAL_MAX_REPROJECTION_ERROR_PIXELS,
+)
 
 
 def _observation_mode(point_count):
@@ -580,6 +585,174 @@ def estimate_cube_pose_from_detection(detection, camera_matrix, dist_coeffs, pre
         previous_pose,
         solve_mode,
     )
+
+
+def estimate_cube_pose_from_partial_detection(
+    detection, camera_matrix, dist_coeffs, previous_pose=None,
+):
+    """Refine a trusted cube pose from three or more matched vertices.
+
+    This local path is intentionally impossible to use for global acquisition:
+    it requires the previous symmetry-normalized pose and an extrinsic PnP
+    guess.  The matched-vertex reprojection gate is the geometric check before
+    the normal temporal/depth gates in ``CubeTracker``.
+    """
+    diagnostics = {
+        "solve_mode": "partial_local",
+        "partial": True,
+        "status": "PARTIAL EDGE EVIDENCE",
+        "rejection_reason": None,
+    }
+    if previous_pose is None or not detection or not detection.get("partial"):
+        diagnostics["rejection_reason"] = "NO TRUSTED CUBE POSE"
+        return None, diagnostics
+    if detection.get("rejection_reason"):
+        diagnostics["rejection_reason"] = str(detection["rejection_reason"])
+        return None, diagnostics
+    object_points = np.asarray(detection.get("matched_object_points"), dtype=np.float32).reshape(-1, 3)
+    image_points = np.asarray(detection.get("matched_image_points"), dtype=np.float32).reshape(-1, 2)
+    if len(object_points) < 3 or len(image_points) != len(object_points):
+        diagnostics["rejection_reason"] = "INSUFFICIENT PARTIAL VERTICES"
+        return None, diagnostics
+    try:
+        success, rvec, tvec = cv.solvePnP(
+            object_points,
+            image_points,
+            camera_matrix,
+            dist_coeffs,
+            np.asarray(previous_pose["rvec"], dtype=np.float64).reshape(3, 1).copy(),
+            np.asarray(previous_pose["center_tvec"], dtype=np.float64).reshape(3, 1).copy(),
+            True,
+            cv.SOLVEPNP_ITERATIVE,
+        )
+    except cv.error:
+        success = False
+    if not success or not _is_finite_pose(rvec, tvec) or float(tvec[2, 0]) <= 0:
+        diagnostics["rejection_reason"] = "PARTIAL PNP"
+        return None, diagnostics
+    projected, _ = cv.projectPoints(object_points, rvec, tvec, camera_matrix, dist_coeffs)
+    reprojection = np.linalg.norm(
+        projected.reshape(-1, 2) - image_points,
+        axis=1,
+    )
+    reprojection_error = float(np.sqrt(np.mean(reprojection ** 2)))
+    diagnostics.update({
+        "reprojection_error": reprojection_error,
+        "reprojection_rms": reprojection_error,
+        "point_count": len(object_points),
+        "matched_edge_ids": list(detection.get("matched_edge_ids", [])),
+        "edge_coverage": float(
+            detection.get("edge_coverage", detection.get("perimeter_coverage", 0.0))
+        ),
+        "angle_error_deg": detection.get(
+            "angle_error_deg", detection.get("edge_angle_error_deg")
+        ),
+    })
+    if reprojection_error > CUBE_PARTIAL_MAX_REPROJECTION_ERROR_PIXELS:
+        diagnostics["rejection_reason"] = "PARTIAL GEOMETRY"
+        return None, diagnostics
+
+    # Validate the observation independently against the physical line
+    # samples.  A seeded PnP fit can make three unrelated corners appear
+    # perfect, so fitted vertices are never sufficient evidence by themselves.
+    projected_cube, _ = cv.projectPoints(
+        cube_object_points(), rvec, tvec, camera_matrix, dist_coeffs,
+    )
+    projected_cube = projected_cube.reshape(8, 2)
+    cycle = np.asarray(
+        detection.get("predicted_silhouette_indices", []), dtype=int,
+    ).reshape(-1)
+    line_samples = detection.get("line_samples") or {}
+    edge_ids = [int(item) for item in detection.get("matched_edge_ids", [])]
+    residuals = []
+    angle_errors = []
+    for edge_id in edge_ids:
+        if len(cycle) < 3 or edge_id < 0 or edge_id >= len(cycle):
+            diagnostics["rejection_reason"] = "PARTIAL EDGE EVIDENCE"
+            return None, diagnostics
+        if isinstance(line_samples, dict):
+            samples = line_samples.get(edge_id, line_samples.get(str(edge_id)))
+        elif isinstance(line_samples, (list, tuple)):
+            try:
+                samples = line_samples[edge_ids.index(edge_id)]
+            except (ValueError, IndexError):
+                samples = None
+        elif isinstance(line_samples, np.ndarray) and line_samples.ndim >= 3:
+            try:
+                samples = line_samples[edge_ids.index(edge_id)]
+            except (ValueError, IndexError):
+                samples = None
+        else:
+            samples = None
+        if samples is None and isinstance(detection.get("matched_lines"), (list, tuple)):
+            try:
+                samples = detection["matched_lines"][edge_ids.index(edge_id)]
+            except (ValueError, IndexError):
+                samples = None
+        if samples is None:
+            diagnostics["rejection_reason"] = "PARTIAL EDGE EVIDENCE"
+            return None, diagnostics
+        samples = np.asarray(samples, dtype=np.float64).reshape(-1, 2)
+        if len(samples) < 2 or not np.isfinite(samples).all():
+            diagnostics["rejection_reason"] = "PARTIAL EDGE EVIDENCE"
+            return None, diagnostics
+        start_index = int(cycle[edge_id])
+        end_index = int(cycle[(edge_id + 1) % len(cycle)])
+        predicted_start = projected_cube[start_index]
+        predicted_end = projected_cube[end_index]
+        vector = predicted_end - predicted_start
+        length = float(np.linalg.norm(vector))
+        if length <= 1e-9:
+            diagnostics["rejection_reason"] = "PARTIAL EDGE EVIDENCE"
+            return None, diagnostics
+        sample_direction = samples[-1] - samples[0]
+        cosine = abs(float(np.dot(vector, sample_direction))) / max(
+            float(np.linalg.norm(vector)) * float(np.linalg.norm(sample_direction)),
+            1e-12,
+        )
+        angle_error = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+        angle_errors.append(angle_error)
+        if angle_error > CUBE_PARTIAL_MAX_ANGLE_ERROR_DEG:
+            diagnostics["rejection_reason"] = "PARTIAL EDGE ANGLE"
+            diagnostics["angle_error_deg"] = max(angle_errors)
+            return None, diagnostics
+        normal_distance = np.abs(
+            vector[0] * (samples[:, 1] - predicted_start[1])
+            - vector[1] * (samples[:, 0] - predicted_start[0])
+        ) / length
+        residuals.extend(normal_distance.tolist())
+    independent_residual = (
+        float(np.sqrt(np.mean(np.square(residuals)))) if residuals else float("inf")
+    )
+    diagnostics["independent_edge_residual_pixels"] = independent_residual
+    diagnostics["independent_edge_residual"] = independent_residual
+    diagnostics["edge_residual_rms"] = independent_residual
+    diagnostics["angle_error_deg"] = max(angle_errors, default=None)
+    if not residuals or independent_residual > CUBE_PARTIAL_MAX_EDGE_RESIDUAL_PIXELS:
+        diagnostics["rejection_reason"] = "PARTIAL EDGE RESIDUAL"
+        return None, diagnostics
+    pose = {key: value for key, value in previous_pose.items()}
+    pose.update({
+        "rvec": np.asarray(rvec, dtype=np.float64).reshape(3, 1).copy(),
+        "tvec": np.asarray(tvec, dtype=np.float64).reshape(3, 1).copy(),
+        "partial": True,
+        "full": False,
+        "observation_mode": "partial",
+        "orientation_ambiguous": bool(previous_pose.get("orientation_ambiguous", False)),
+        "point_count": len(object_points),
+        "partial_matched_vertex_indices": list(detection.get("matched_vertex_indices", [])),
+        "partial_reprojection_error": reprojection_error,
+        "partial_matched_edge_ids": edge_ids,
+        "partial_edge_coverage": float(detection.get("edge_coverage", 0.0)),
+        "partial_angle_error_deg": diagnostics.get("angle_error_deg"),
+        "partial_independent_edge_residual": independent_residual,
+        "independent_edge_residual": independent_residual,
+        "solve_mode": "partial_local",
+    })
+    pose = align_cube_pose_symmetry(pose, previous_pose, camera_matrix, dist_coeffs)
+    diagnostics["rejection_reason"] = None
+    diagnostics["status"] = "PARTIAL EDGE EVIDENCE"
+    return pose, diagnostics
 
 
 def estimate_cube_pose_from_hypotheses(hypotheses, camera_matrix, dist_coeffs, previous_pose=None, observed_points=None, solve_mode=None):

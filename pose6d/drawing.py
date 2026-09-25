@@ -149,7 +149,15 @@ def draw_pose_guide(frame):
         ("Roll   rotate around X axis", AXIS_X_COLOR),
         ("Pitch  rotate around Y axis", AXIS_Y_COLOR),
         ("Yaw    rotate around Z axis", AXIS_Z_COLOR),
-        ("Unmarked cube: RPY has 24 symmetry-equivalent views", (220, 220, 220))
+        ("Unmarked cube: RPY has 24 symmetry-equivalent views", (220, 220, 220)),
+        ("Balls: centre/range only; orientation is not observable", (220, 220, 220)),
+        ("1: select the small_ball colour profile", (220, 220, 220)),
+        ("2: select the large_ball colour profile", (220, 220, 220)),
+        ("Left click ball: calibrate the selected profile", (220, 220, 220)),
+        ("S: save both ball colour profiles", (220, 220, 220)),
+        ("R: reset/disable the selected ball profile", (220, 220, 220)),
+        ("H: toggle handheld partial tracking", (220, 220, 220)),
+        ("Q: quit the application", (220, 220, 220)),
     ]
 
     panel_width = min(500, frame_width - 20)
@@ -236,3 +244,51 @@ def format_cube_geometry_diagnostics(diagnostics):
         f"IoU {values[4]:.2f}/{values[5]:.2f} | "
         f"Area {area_ratio:.2f}"
     )
+
+
+def draw_ball_pose(frame, pose, camera_matrix, dist_coeffs, color=(0, 255, 255),
+                   status="BALL"):
+    """Draw only the spherical outline and centre (never axes or RPY)."""
+    projected = pose.get("projected_contour")
+    if projected is not None:
+        contour = np.rint(np.asarray(projected).reshape(-1, 1, 2)).astype(np.int32)
+        cv.polylines(frame, [contour], True, color, 2, cv.LINE_AA)
+    center_tvec = np.asarray(pose["center_tvec"], dtype=np.float64).reshape(3, 1)
+    projected_center, _ = cv.projectPoints(
+        np.zeros((1, 3), dtype=np.float64),
+        np.zeros((3, 1), dtype=np.float64),
+        center_tvec,
+        camera_matrix,
+        dist_coeffs,
+    )
+    center = tuple(np.rint(projected_center.reshape(2)).astype(int))
+    cv.circle(frame, center, 5, color, -1, cv.LINE_AA)
+    cv.putText(
+        frame,
+        str(status),
+        (center[0] + 8, center[1] - 8),
+        cv.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        color,
+        2,
+        cv.LINE_AA,
+    )
+    return center
+
+
+def ball_text_lines(result, pose, millimetres_per_metre=1000.0):
+    """Return compact ball telemetry lines for the app overlay."""
+    if pose is None:
+        return []
+    center = np.asarray(pose["center_tvec"], dtype=np.float64).reshape(3)
+    radius_mm = float(pose.get("radius_m", 0.0)) * millimetres_per_metre
+    range_mm = float(np.linalg.norm(center)) * millimetres_per_metre
+    status = result.get("status", "LOST") if result is not None else "LOST"
+    return [
+        (f"{pose.get('profile_id', 'ball')}: {status}", POSE_TEXT_COLOR),
+        (f"R:{radius_mm:.1f} mm", POSE_TEXT_COLOR),
+        (f"X:{center[0] * millimetres_per_metre:+.1f} mm", AXIS_X_COLOR),
+        (f"Y:{center[1] * millimetres_per_metre:+.1f} mm", AXIS_Y_COLOR),
+        (f"Z:{center[2] * millimetres_per_metre:+.1f} mm", AXIS_Z_COLOR),
+        (f"Range:{range_mm:.1f} mm", POSE_TEXT_COLOR),
+    ]

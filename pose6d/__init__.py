@@ -4,6 +4,7 @@ from .settings import *
 from .camera import *
 from .calibration import *
 from .aruco import *
+from .ball_detection import *
 from .shapes import *
 from .cube_detection import *
 from .cube_geometry import *

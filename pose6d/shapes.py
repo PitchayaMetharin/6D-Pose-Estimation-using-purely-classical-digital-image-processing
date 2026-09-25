@@ -122,11 +122,13 @@ def classify_shape(contour):
     return None
 
 
-def detect_shapes(frame):
-    gray = cv.cvtColor(
-        frame,
-        cv.COLOR_BGR2GRAY
-    )
+def detect_shapes(frame, gray=None):
+    """Detect generic shapes, optionally reusing a caller's gray frame."""
+    if gray is None:
+        gray = cv.cvtColor(
+            frame,
+            cv.COLOR_BGR2GRAY
+        )
 
     blurred = cv.GaussianBlur(
         gray,
